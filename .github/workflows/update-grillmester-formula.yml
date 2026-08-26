@@ -1,0 +1,520 @@
+name: Update Grillmester formula
+
+on:
+  schedule:
+    - cron: "15 */6 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/update-grillmester-formula.yml"
+      - "Formula/grillmester.rb"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: >-
+    ${{ github.event_name == 'pull_request' &&
+        format('grillmester-pr-{0}', github.event.pull_request.number) ||
+        'formula-update' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Job timeouts bound active runner work; retry platform queue cancellations.
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      formula_base64: ${{ steps.candidate.outputs.formula_base64 }}
+      formula_sha256: ${{ steps.candidate.outputs.formula_sha256 }}
+      should_publish: ${{ steps.candidate.outputs.should_publish }}
+      should_test: ${{ steps.candidate.outputs.should_test }}
+      version: ${{ steps.candidate.outputs.version }}
+    steps:
+      - name: Check out tap without write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Verify the latest immutable stable release
+        id: candidate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          candidate_root="${RUNNER_TEMP}/grillmester-candidate"
+          mkdir -m 700 "${candidate_root}"
+          gh api repos/navikt/grillmester/releases/latest > "${candidate_root}/release.json"
+
+          python3 -I -S - \
+            "${candidate_root}/release.json" Formula/grillmester.rb \
+            "${candidate_root}/metadata.json" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          release_path, formula_path, output_path = map(Path, sys.argv[1:])
+          release = json.loads(release_path.read_text(encoding="utf-8"))
+          tag = release.get("tag_name")
+          stable = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", tag or "")
+          if stable is None:
+              raise SystemExit("latest release tag is not strict stable SemVer")
+          if release.get("draft") is not False or release.get("prerelease") is not False:
+              raise SystemExit("latest release is not published stable metadata")
+          if release.get("immutable") is not True:
+              raise SystemExit("latest stable release is not immutable")
+
+          required_names = {
+              f"grillmester-terminal-{tag}.tar.gz",
+              "grillmester.rb",
+          }
+          assets = release.get("assets")
+          if not isinstance(assets, list):
+              raise SystemExit("latest stable release has no asset list")
+
+          bounds = {
+              f"grillmester-terminal-{tag}.tar.gz": (1, 50_000_000),
+              "grillmester.rb": (1, 100_000),
+          }
+          normalized_assets = {}
+          for asset in assets:
+              name = asset.get("name")
+              if name not in required_names:
+                  continue
+              if name in normalized_assets:
+                  raise SystemExit(f"latest stable release has duplicate assets: {name}")
+              digest = asset.get("digest")
+              url = asset.get("url")
+              size = asset.get("size")
+              if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+                  raise SystemExit(f"release asset has no valid API digest: {name}")
+              if not isinstance(url, str) or re.fullmatch(
+                  r"https://api\.github\.com/repos/navikt/grillmester/releases/assets/[0-9]+", url
+              ) is None:
+                  raise SystemExit(f"release asset has an unexpected API URL: {name}")
+              lower, upper = bounds[name]
+              if not isinstance(size, int) or not lower <= size <= upper:
+                  raise SystemExit(f"release asset has an invalid size: {name}")
+              normalized_assets[name] = {
+                  "digest": digest.removeprefix("sha256:"),
+                  "url": url,
+              }
+          if normalized_assets.keys() != required_names:
+              missing = sorted(required_names - normalized_assets.keys())
+              raise SystemExit(f"latest stable release is missing Homebrew assets: {missing}")
+
+          if formula_path.is_symlink() or not formula_path.is_file():
+              raise SystemExit("current Grillmester formula is not a regular file")
+          formula = formula_path.read_text(encoding="utf-8")
+          current_matches = re.findall(
+              r'/releases/download/(v([0-9]+)\.([0-9]+)\.([0-9]+))/grillmester-terminal-\1\.tar\.gz',
+              formula,
+          )
+          if len(current_matches) != 1:
+              raise SystemExit("current Grillmester formula has an unexpected release URL")
+          current = tuple(int(part) for part in current_matches[0][1:])
+          latest = tuple(int(part) for part in stable.groups())
+          if latest < current:
+              raise SystemExit("latest stable release is older than the current formula")
+
+          output_path.write_text(
+              json.dumps(
+                  {
+                      "assets": normalized_assets,
+                      "current": ".".join(map(str, current)),
+                      "tag": tag,
+                      "version": ".".join(stable.groups()),
+                  },
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          tag="$(jq -er '.tag' "${candidate_root}/metadata.json")"
+          version="$(jq -er '.version' "${candidate_root}/metadata.json")"
+          current="$(jq -er '.current' "${candidate_root}/metadata.json")"
+          bundle_name="grillmester-terminal-${tag}.tar.gz"
+
+          if [[ "${EVENT_NAME}" == "schedule" && "${version}" == "${current}" ]]; then
+            expected_formula_digest="$(jq -er '.assets["grillmester.rb"].digest' \
+              "${candidate_root}/metadata.json")"
+            actual_formula_digest="$(sha256sum Formula/grillmester.rb | cut -d' ' -f1)"
+            if [[ "${actual_formula_digest}" != "${expected_formula_digest}" ]]; then
+              echo "Current formula differs from the immutable release asset." >&2
+              exit 1
+            fi
+            {
+              echo "formula_base64="
+              echo "formula_sha256=${actual_formula_digest}"
+              echo "should_publish=false"
+              echo "should_test=false"
+              echo "version=${version}"
+            } >> "${GITHUB_OUTPUT}"
+            echo "Current formula matches immutable stable release ${version}."
+            exit 0
+          fi
+
+          formula_url="$(jq -er '.assets["grillmester.rb"].url' \
+            "${candidate_root}/metadata.json")"
+          expected_formula_digest="$(jq -er '.assets["grillmester.rb"].digest' \
+            "${candidate_root}/metadata.json")"
+          gh api -H "Accept: application/octet-stream" "${formula_url}" \
+            > "${candidate_root}/grillmester.rb"
+          actual_formula_digest="$(sha256sum "${candidate_root}/grillmester.rb" | cut -d' ' -f1)"
+          [[ "${actual_formula_digest}" == "${expected_formula_digest}" ]]
+
+          bundle_digest="$(jq -er --arg name "${bundle_name}" '.assets[$name].digest' \
+            "${candidate_root}/metadata.json")"
+
+          python3 -I -S - \
+            Formula/grillmester.rb "${candidate_root}/grillmester.rb" \
+            "${tag}" "${bundle_name}" "${bundle_digest}" "${EVENT_NAME}" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
+
+          current_path = Path(sys.argv[1])
+          candidate_path = Path(sys.argv[2])
+          tag, bundle_name, bundle_digest, event_name = sys.argv[3:]
+          if current_path.is_symlink() or not current_path.is_file():
+              raise SystemExit("current Grillmester formula is not a regular file")
+          current_bytes = current_path.read_bytes()
+          candidate_bytes = candidate_path.read_bytes()
+          try:
+              current = current_bytes.decode()
+              candidate = candidate_bytes.decode()
+          except UnicodeDecodeError as error:
+              raise SystemExit("formula is not valid UTF-8") from error
+
+          expected_url = (
+              f'https://github.com/navikt/grillmester/releases/download/{tag}/{bundle_name}'
+          )
+          checks = {
+              f'  url "{expected_url}"': 1,
+              f'  sha256 "{bundle_digest}"': 1,
+              '  depends_on "navikt/tap/cplt"': 1,
+              '  depends_on "python@3.13"': 1,
+              '  depends_on "ripgrep"': 1,
+          }
+          for value, count in checks.items():
+              if candidate.count(value) != count:
+                  raise SystemExit(f"candidate formula has an unexpected contract: {value}")
+          if re.search(
+              r"libexec/clients|bin\.install.*(?:opencode|copilot)",
+              candidate,
+              re.IGNORECASE,
+          ):
+              raise SystemExit("candidate formula must not ship private terminal clients")
+
+          url_pattern = re.compile(
+              r'^  url "https://github\.com/navikt/grillmester/releases/download/'
+              r'(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))/'
+              r'grillmester-terminal-\1\.tar\.gz"$',
+              re.MULTILINE,
+          )
+          sha_pattern = re.compile(r'^  sha256 "[0-9a-f]{64}"$', re.MULTILINE)
+
+          def normalized_template(formula: str, label: str) -> str:
+              if len(url_pattern.findall(formula)) != 1:
+                  raise SystemExit(f"{label} formula has an unexpected release URL")
+              if len(sha_pattern.findall(formula)) != 1:
+                  raise SystemExit(f"{label} formula has an unexpected bundle digest")
+              normalized = url_pattern.sub('  url "__GRILLMESTER_RELEASE_URL__"', formula)
+              return sha_pattern.sub('  sha256 "__GRILLMESTER_BUNDLE_SHA256__"', normalized)
+
+          if normalized_template(current, "current") != normalized_template(candidate, "candidate"):
+              raise SystemExit(
+                  "candidate changes reviewed formula logic; use a dedicated tap PR"
+              )
+
+          current_match = url_pattern.search(current)
+          candidate_match = url_pattern.search(candidate)
+          if current_match is None or candidate_match is None:
+              raise SystemExit("formula release URL validation was inconsistent")
+          current_version = tuple(int(part) for part in current_match.groups()[1:])
+          candidate_version = tuple(int(part) for part in candidate_match.groups()[1:])
+          if event_name == "pull_request" and current_version != candidate_version:
+              raise SystemExit("pull request formula is not the latest stable release")
+          if current_version == candidate_version and current_bytes != candidate_bytes:
+              raise SystemExit("same Grillmester version has different formula bytes")
+          PY
+          formula_digest="$(sha256sum "${candidate_root}/grillmester.rb" | cut -d' ' -f1)"
+          formula_base64="$(base64 -w 0 "${candidate_root}/grillmester.rb")"
+          should_publish=false
+          should_test=false
+          if [[ "${version}" != "${current}" ]]; then
+            should_test=true
+            if [[ "${EVENT_NAME}" != "pull_request" ]]; then
+              should_publish=true
+            fi
+          elif [[ "${EVENT_NAME}" != "schedule" ]]; then
+            should_test=true
+          fi
+
+          {
+            echo "formula_base64=${formula_base64}"
+            echo "formula_sha256=${formula_digest}"
+            echo "should_publish=${should_publish}"
+            echo "should_test=${should_test}"
+            echo "version=${version}"
+          } >> "${GITHUB_OUTPUT}"
+
+          echo "Current formula: ${current}"
+          echo "Latest immutable stable release: ${version}"
+          echo "Test candidate: ${should_test}"
+          echo "Publish update: ${should_publish}"
+
+  test-candidate:
+    needs: prepare
+    if: needs.prepare.outputs.should_test == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            machine: arm64
+          - runner: macos-15-intel
+            machine: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      CANDIDATE_FORMULA_BASE64: ${{ needs.prepare.outputs.formula_base64 }}
+      CANDIDATE_FORMULA_SHA256: ${{ needs.prepare.outputs.formula_sha256 }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_AUTOREMOVE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Install and test exact candidate formula
+        env:
+          EXPECTED_MACHINE: ${{ matrix.machine }}
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          qa_root="${RUNNER_TEMP}/grillmester-formula-qa"
+          formula="${qa_root}/grillmester.rb"
+          xdg_config_home="${qa_root}/xdg-config"
+          tap_name="navikt/tap"
+          formula_name="${tap_name}/grillmester"
+          machine="$(uname -m)"
+          if [[ "${machine}" != "${EXPECTED_MACHINE}" ]]; then
+            echo "Expected ${EXPECTED_MACHINE} runner, got ${machine}." >&2
+            exit 1
+          fi
+          case "${machine}" in
+            arm64) tap_storage="/opt/homebrew/Library/Taps" ;;
+            x86_64) tap_storage="/usr/local/Homebrew/Library/Taps" ;;
+            *)
+              echo "Unsupported macOS runner architecture: ${machine}" >&2
+              exit 1
+              ;;
+          esac
+          if [[ "${RUNNER_ENVIRONMENT}" != "github-hosted" ]]; then
+            echo "Formula QA requires a disposable GitHub-hosted runner." >&2
+            exit 1
+          fi
+          [[ "$(brew --repository)/Library/Taps" == "${tap_storage}" ]]
+          mkdir -m 700 "${qa_root}"
+          mkdir -m 700 "${xdg_config_home}"
+          export XDG_CONFIG_HOME="${xdg_config_home}"
+          python3 -I -S - "${formula}" <<'PY'
+          import base64
+          import binascii
+          import hashlib
+          import os
+          import sys
+          from pathlib import Path
+
+          destination = Path(sys.argv[1])
+          encoded = os.environ["CANDIDATE_FORMULA_BASE64"]
+          expected = os.environ["CANDIDATE_FORMULA_SHA256"]
+          try:
+              content = base64.b64decode(encoded, validate=True)
+          except binascii.Error as error:
+              raise SystemExit("candidate formula encoding is invalid") from error
+          if not content or len(content) > 100_000:
+              raise SystemExit("candidate formula has an invalid size")
+          if hashlib.sha256(content).hexdigest() != expected:
+              raise SystemExit("candidate formula digest differs")
+          destination.write_bytes(content)
+          destination.chmod(0o644)
+          PY
+
+          runner_python_links=(
+            idle3.13 pip3.13 pydoc3.13 python3.13 python3.13-config
+          )
+          prepare_hosted_intel_python_links() {
+            [[ "${machine}" == "x86_64" ]] || return 0
+            installed_formulae="$(brew list --formula -1)"
+            if printf '%s\n' "${installed_formulae}" | grep -Fxq python@3.13; then
+              return 0
+            fi
+            # These fixed labels are disposable GitHub-hosted runners.
+            for name in "${runner_python_links[@]}"; do
+              target="/usr/local/bin/${name}"
+              if [[ ! -e "${target}" && ! -L "${target}" ]]; then
+                continue
+              fi
+              [[ -L "${target}" ]]
+              [[ "$(readlink "${target}")" == \
+                 "/Library/Frameworks/Python.framework/Versions/3.13/bin/${name}" ]]
+              mv "${target}" "${qa_root}/${name}"
+            done
+          }
+
+          ruby -c "${formula}"
+
+          # These fixed labels are disposable GitHub-hosted runners. Remove
+          # preloaded third-party taps so Homebrew cannot import their formulae.
+          if [[ -e "${tap_storage}" || -L "${tap_storage}" ]]; then
+            [[ -d "${tap_storage}" && ! -L "${tap_storage}" ]]
+            mv "${tap_storage}" "${qa_root}/preloaded-taps"
+          fi
+          mkdir -m 755 "${tap_storage}"
+          remaining_taps="$(brew tap)"
+          if [[ -n "${remaining_taps}" ]]; then
+            echo "Preloaded Homebrew taps remain after isolation:" >&2
+            printf '%s\n' "${remaining_taps}" >&2
+            exit 1
+          fi
+
+          brew tap "${tap_name}"
+          tap_root="$(brew --repository "${tap_name}")"
+          install -m 0644 "${formula}" "${tap_root}/Formula/grillmester.rb"
+          brew trust --json=v1 > "${qa_root}/trust-before.json"
+          prepare_hosted_intel_python_links
+          brew install --formula navikt/tap/cplt "${formula_name}"
+          brew trust --json=v1 > "${qa_root}/trust-after.json"
+          python3 -I -S - \
+            "${qa_root}/trust-before.json" "${qa_root}/trust-after.json" \
+            navikt/tap/cplt "${formula_name}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          def load(path: str):
+              trusted = json.loads(Path(path).read_text(encoding="utf-8"))
+              formulae = trusted.get("formulae", [])
+              taps = trusted.get("taps", [])
+              if not isinstance(formulae, list) or not isinstance(taps, list):
+                  raise SystemExit("Homebrew trust store has an unexpected shape")
+              return formulae, taps
+
+          before_formulae, before_taps = load(sys.argv[1])
+          after_formulae, after_taps = load(sys.argv[2])
+          expected = sys.argv[3:]
+          unexpected = [name for name in expected if name in before_formulae]
+          if unexpected:
+              raise SystemExit(f"formula unexpectedly trusted before install: {unexpected}")
+          missing = [name for name in expected if name not in after_formulae]
+          if missing:
+              raise SystemExit(f"fully qualified install did not establish trust: {missing}")
+          target_taps = {"navikt/tap"}
+          if target_taps.intersection(before_taps) or target_taps.intersection(after_taps):
+              raise SystemExit("fully qualified install trusted a whole target tap")
+          PY
+
+          brew style "${formula_name}"
+          brew audit --strict "${formula_name}"
+          brew test --verbose "${formula_name}"
+          installed_prefix="$(brew --prefix "${formula_name}")"
+          clients_path="${installed_prefix}/libexec/clients"
+          [[ ! -e "${clients_path}" && ! -L "${clients_path}" ]]
+          brew uninstall --formula "${formula_name}"
+
+  publish:
+    needs:
+      - prepare
+      - test-candidate
+    if: >-
+      github.event_name != 'pull_request' &&
+      github.ref == 'refs/heads/main' &&
+      needs.prepare.outputs.should_publish == 'true' &&
+      needs.test-candidate.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      CANDIDATE_FORMULA_BASE64: ${{ needs.prepare.outputs.formula_base64 }}
+      CANDIDATE_FORMULA_SHA256: ${{ needs.prepare.outputs.formula_sha256 }}
+      CANDIDATE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Check out current tap with write credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Publish only the already verified formula bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          candidate="${RUNNER_TEMP}/grillmester.rb"
+          python3 -I -S - "${candidate}" Formula/grillmester.rb <<'PY'
+          import base64
+          import binascii
+          import hashlib
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          destination, current_path = map(Path, sys.argv[1:])
+          encoded = os.environ["CANDIDATE_FORMULA_BASE64"]
+          expected = os.environ["CANDIDATE_FORMULA_SHA256"]
+          candidate_version_text = os.environ["CANDIDATE_VERSION"]
+          try:
+              content = base64.b64decode(encoded, validate=True)
+          except binascii.Error as error:
+              raise SystemExit("verified formula encoding is invalid") from error
+          if not content or len(content) > 100_000:
+              raise SystemExit("verified formula has an invalid size")
+          if hashlib.sha256(content).hexdigest() != expected:
+              raise SystemExit("verified formula digest differs")
+          if current_path.is_symlink() or not current_path.is_file():
+              raise SystemExit("current Grillmester formula is not a regular file")
+          current_content = current_path.read_bytes()
+          current_match = re.search(
+              rb"/releases/download/v([0-9]+)\.([0-9]+)\.([0-9]+)/"
+              rb"grillmester-terminal-v\1\.\2\.\3\.tar\.gz",
+              current_content,
+          )
+          candidate_match = re.fullmatch(
+              r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)",
+              candidate_version_text,
+          )
+          if current_match is None or candidate_match is None:
+              raise SystemExit("could not compare current and candidate versions")
+          current_version = tuple(int(part) for part in current_match.groups())
+          candidate_version = tuple(int(part) for part in candidate_match.groups())
+          if candidate_version < current_version:
+              raise SystemExit("refusing to downgrade the Grillmester formula")
+          if candidate_version == current_version and content != current_content:
+              raise SystemExit("same Grillmester version has different formula bytes")
+          destination.write_bytes(content)
+          PY
+
+          if cmp -s "${candidate}" Formula/grillmester.rb; then
+            echo "Formula is already current."
+            exit 0
+          fi
+          cp "${candidate}" Formula/grillmester.rb
+          changed="$(git diff --name-only)"
+          [[ "${changed}" == "Formula/grillmester.rb" ]]
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/grillmester.rb
+          git commit -m "chore: update Grillmester to ${CANDIDATE_VERSION}"
+          git push
